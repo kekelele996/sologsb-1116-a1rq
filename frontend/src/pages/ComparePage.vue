@@ -11,6 +11,7 @@ import { recordStore } from '@/stores/recordStore'
 import { sporeStore } from '@/stores/sporeStore'
 import { pointStore } from '@/stores/pointStore'
 import { identifyStore } from '@/stores/identifyStore'
+import { evaluateReview } from '@/utils/sides'
 
 const route = useRoute()
 const router = useRouter()
@@ -75,7 +76,12 @@ function pointName(pointId: string): string {
 
 function conclusionOf(recordId: string): string {
   const log = identifyState.logs.find((item) => item.recordId === recordId)
-  return log ? `${log.conclusion}（${log.confidence}${log.needReview ? '，待复核' : ''}）` : '尚无结论'
+  if (!log) return '尚无结论'
+  const spore = sporeState.spores.find((item) => item.recordId === recordId) ?? null
+  const record = recordState.records.find((item) => item.id === recordId)
+  const evaluation = evaluateReview(record, spore, log)
+  const flag = evaluation.stale ? '，待重新确认' : evaluation.status === '未复核' ? '，待复核' : ''
+  return `${log.conclusion}（${log.confidence}${flag}）`
 }
 
 interface DiffRow {

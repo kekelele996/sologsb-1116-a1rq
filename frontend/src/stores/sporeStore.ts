@@ -1,6 +1,7 @@
 import { createStore } from 'zustand/vanilla'
 import type { SporePrint } from '@/types'
 import { db, syncAll, syncDelete, syncPut } from '@/hooks/usePersistentStore'
+import { withRetry } from '@/utils/async'
 
 export interface SporeState {
   spores: SporePrint[]
@@ -20,7 +21,8 @@ export const sporeStore = createStore<SporeState>((set, get) => ({
     set({ spores, loaded: true })
   },
   save: async (spore) => {
-    await syncPut<SporePrint>(db.spores, spore)
+    // 采集侧保存：失败按本侧重试，不影响复核侧
+    await withRetry(() => syncPut<SporePrint>(db.spores, spore))
     await get().hydrate()
   },
   remove: async (id) => {

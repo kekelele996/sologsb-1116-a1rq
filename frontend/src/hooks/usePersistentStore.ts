@@ -2,9 +2,10 @@ import { onUnmounted, reactive } from 'vue'
 import type { StoreApi } from 'zustand/vanilla'
 import Dexie, { type Table } from 'dexie'
 import type { CollectPoint, FungusRecord, IdentifyLog, SporePrint } from '@/types'
+import { basisSnapshotFor } from '@/utils/sides'
 
 /** IndexedDB 数据结构版本号 */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
@@ -29,7 +30,7 @@ class FungiGuideDb extends Dexie {
       meta: 'key'
     })
     // v2：新增「菌肉变色反应」字段，迁移时为历史条目补齐默认值（不变色）
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         records: 'id, code, pointId, attachment, capShape',
         spores: 'id, recordId, color, observeDate',
@@ -47,6 +48,23 @@ class FungiGuideDb extends Dexie {
             }
           })
       })
+    // v3：两边分治——采集侧（形态 + 孢子印）与复核侧（结论 + 复核状态）各管各的。
+    // 第一次打开先回填归属：条目盖采集侧戳，结论补复核状态与依据快照，再启用分边。
+    this.version(SCHEMA_VERSION)
+      .stores({
+        records: 'id, code, pointId, attachment, capShape, side',
+        spores: 'id, recordId, color, observeDate',
+        points: 'id, name, substrate, vegetation',
+        identifies: 'id, recordId, conclusion, date, reviewStatus',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        await backfillSidesTables(
+          tx.table<FungusRecord, string>('records'),
+          tx.table<SporePrint, string>('spores'),
+          tx.table<IdentifyLog, string>('identifies')
+        )
+      })
   }
 }
 
@@ -55,6 +73,44 @@ export const db = new FungiGuideDb()
 /** 写入当前数据结构版本号 */
 export async function stampDbVersion(): Promise<void> {
   await db.meta.put({ key: 'schemaVersion', value: SCHEMA_VERSION })
+}
+
+/**
+ * 回填两侧归属与锚点（表级共用逻辑，供 Dexie 升级事务与运行时调用）：
+ * - 条目 → 盖采集侧戳（side='collector'）
+ * - 结论 → 补复核状态与依据快照（显微观察快照为空，锁定两边不动）
+ */
+async function backfillSidesTables(
+  records: Table<FungusRecord, string>,
+  spores: Table<SporePrint, string>,
+  identifies: Table<IdentifyLog, string>
+): Promise<void> {
+  const [recordRows, sporeRows] = await Promise.all([records.toArray(), spores.toArray()])
+  const recordMap = new Map(recordRows.map((record) => [record.id, record]))
+  const sporeMap = new Map(sporeRows.map((spore) => [spore.recordId, spore]))
+
+  await records.toCollection().modify((record) => {
+    if (record.side === undefined) record.side = 'collector'
+  })
+
+  await identifies.toCollection().modify((log) => {
+    if (log.reviewStatus === undefined || log.basisSnapshot === undefined) {
+      const record = recordMap.get(log.recordId)
+      const spore = sporeMap.get(log.recordId)
+      log.basisSnapshot = record ? basisSnapshotFor(log.basis, record, spore) : ''
+      log.reviewStatus = log.needReview ? '未复核' : '已确认'
+      if (log.reviewStatus === '已确认' && !log.confirmedDate) log.confirmedDate = log.date
+    }
+  })
+}
+
+/** 运行时回填：seed 演示数据或漏网数据第一次打开时补齐两侧归属，幂等 */
+export async function backfillSides(): Promise<void> {
+  const before = await db.identifies.filter((log) => log.reviewStatus === undefined || log.basisSnapshot === undefined).count()
+  const recordsMissing = await db.records.filter((record) => record.side === undefined).count()
+  if (before === 0 && recordsMissing === 0) return
+  await backfillSidesTables(db.records, db.spores, db.identifies)
+  await db.meta.put({ key: 'sidesBackfilled', value: SCHEMA_VERSION })
 }
 
 /** 读取整表 */
@@ -89,7 +145,7 @@ export async function seedDemoData(): Promise<void> {
 
   const today = new Date().toISOString().slice(0, 10)
 
-  await db.points.bulkPut([
+  const points: CollectPoint[] = [
     {
       id: 'pt_bhs',
       name: '百花山栎树林样线',
@@ -114,9 +170,9 @@ export async function seedDemoData(): Promise<void> {
       collectDate: today,
       collector: '沈禾'
     }
-  ])
+  ]
 
-  await db.records.bulkPut([
+  const records: FungusRecord[] = [
     {
       id: 'rec_001',
       code: 'BHS-2026-001',
@@ -139,7 +195,8 @@ export async function seedDemoData(): Promise<void> {
       hostTree: '辽东栎',
       collectDate: today,
       collector: '沈禾',
-      note: '菌管层易剥离，仅作形态记录'
+      note: '菌管层易剥离，仅作形态记录',
+      side: 'collector'
     },
     {
       id: 'rec_002',
@@ -163,7 +220,8 @@ export async function seedDemoData(): Promise<void> {
       hostTree: '油松',
       collectDate: today,
       collector: '沈禾',
-      note: '菌褶边缘略带紫晕'
+      note: '菌褶边缘略带紫晕',
+      side: 'collector'
     },
     {
       id: 'rec_003',
@@ -187,11 +245,12 @@ export async function seedDemoData(): Promise<void> {
       hostTree: '麻栎',
       collectDate: today,
       collector: '祁野',
-      note: '生于倒木侧面，质地木栓化'
+      note: '生于倒木侧面，质地木栓化',
+      side: 'collector'
     }
-  ])
+  ]
 
-  await db.spores.bulkPut([
+  const spores: SporePrint[] = [
     {
       id: 'spo_001',
       recordId: 'rec_001',
@@ -219,32 +278,48 @@ export async function seedDemoData(): Promise<void> {
       observeDate: today,
       moisture: '木质化样本，印痕浅'
     }
-  ])
+  ]
 
-  await db.identifies.bulkPut([
-    {
-      id: 'idf_001',
-      recordId: 'rec_001',
-      conclusion: 'Boletus sp.',
-      basis: '形态特征',
-      referenceBook: '《中国大型真菌》',
-      referencePage: 'P.312',
-      confidence: '低',
-      needReview: true,
-      reviewer: '祁野',
-      date: today
-    },
-    {
-      id: 'idf_002',
-      recordId: 'rec_002',
-      conclusion: 'Lepista sordida',
-      basis: '孢子印',
-      referenceBook: '《菌物图鉴》',
-      referencePage: 'P.145',
-      confidence: '中',
-      needReview: false,
-      reviewer: '祁野',
-      date: today
+  // 结论（复核侧）：按依据认范围锚定采集侧快照
+  const recordMap = new Map(records.map((record) => [record.id, record]))
+  const sporeMap = new Map(spores.map((spore) => [spore.recordId, spore]))
+  const buildLog = (
+    id: string,
+    recordId: string,
+    conclusion: string,
+    basis: IdentifyLog['basis'],
+    referenceBook: string,
+    referencePage: string,
+    confidence: IdentifyLog['confidence'],
+    needReview: boolean,
+    reviewer: string
+  ): IdentifyLog => {
+    const record = recordMap.get(recordId)
+    const spore = sporeMap.get(recordId) ?? null
+    return {
+      id,
+      recordId,
+      conclusion,
+      basis,
+      referenceBook,
+      referencePage,
+      confidence,
+      needReview,
+      reviewer,
+      date: today,
+      reviewStatus: needReview ? '未复核' : '已确认',
+      basisSnapshot: record ? basisSnapshotFor(basis, record, spore) : '',
+      confirmedDate: needReview ? undefined : today
     }
-  ])
+  }
+
+  const identifies: IdentifyLog[] = [
+    buildLog('idf_001', 'rec_001', 'Boletus sp.', '形态特征', '《中国大型真菌》', 'P.312', '低', true, '祁野'),
+    buildLog('idf_002', 'rec_002', 'Lepista sordida', '孢子印', '《菌物图鉴》', 'P.145', '中', false, '祁野')
+  ]
+
+  await db.points.bulkPut(points)
+  await db.records.bulkPut(records)
+  await db.spores.bulkPut(spores)
+  await db.identifies.bulkPut(identifies)
 }

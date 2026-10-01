@@ -23,6 +23,8 @@ import { recordStore } from '@/stores/recordStore'
 import { sporeStore } from '@/stores/sporeStore'
 import { pointStore } from '@/stores/pointStore'
 import { identifyStore } from '@/stores/identifyStore'
+import { evaluateReview } from '@/utils/sides'
+import type { ReviewStatus } from '@/types'
 import { uid } from '@/utils/id'
 
 const router = useRouter()
@@ -80,6 +82,21 @@ function pointName(pointId: string): string {
 function identifyOf(recordId: string): { conclusion: string; confidence: string; needReview: boolean } | null {
   const log = identifyState.logs.find((item) => item.recordId === recordId)
   return log ? { conclusion: log.conclusion, confidence: log.confidence, needReview: log.needReview } : null
+}
+
+/** 复核侧有效状态（按依据认范围：形态/孢子印变动会把已确认结论顶成待重新确认） */
+function reviewStatusOf(recordId: string): ReviewStatus | '无结论' {
+  const record = recordState.records.find((item) => item.id === recordId)
+  const spore = sporeState.spores.find((item) => item.recordId === recordId) ?? null
+  const log = identifyState.logs.find((item) => item.recordId === recordId)
+  return evaluateReview(record, spore, log).status
+}
+
+function statusTagType(status: ReviewStatus | '无结论'): 'success' | 'warning' | 'danger' | 'info' {
+  if (status === '已确认') return 'success'
+  if (status === '未复核') return 'warning'
+  if (status === '待重新确认') return 'danger'
+  return 'info'
 }
 
 function toggleCompare(id: string): void {
@@ -255,9 +272,12 @@ async function removeRecord(record: FungusRecord): Promise<void> {
             <el-tag type="success" size="small" effect="dark">
               {{ identifyOf(item.record.id)?.conclusion }}
             </el-tag>
+            <el-tag size="small" effect="plain" :type="statusTagType(reviewStatusOf(item.record.id))">
+              {{ reviewStatusOf(item.record.id) }}
+            </el-tag>
             <span class="muted">
               置信度 {{ identifyOf(item.record.id)?.confidence }}
-              <template v-if="identifyOf(item.record.id)?.needReview"> · 待复核</template>
+              <template v-if="reviewStatusOf(item.record.id) === '待重新确认'"> · 形态/孢子印已变</template>
             </span>
           </template>
           <el-tag v-else type="warning" size="small" effect="plain">尚无鉴定结论</el-tag>

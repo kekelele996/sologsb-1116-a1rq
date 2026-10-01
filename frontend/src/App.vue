@@ -6,6 +6,7 @@ import { recordStore } from '@/stores/recordStore'
 import { sporeStore } from '@/stores/sporeStore'
 import { pointStore } from '@/stores/pointStore'
 import { identifyStore } from '@/stores/identifyStore'
+import { evaluateReview } from '@/utils/sides'
 
 const route = useRoute()
 const recordState = useStore(recordStore)
@@ -17,7 +18,8 @@ const menus = [
   { path: '/atlas', label: '图谱总览', icon: 'Grid' },
   { path: '/points', label: '采集点管理', icon: 'Location' },
   { path: '/identify', label: '鉴定工作页', icon: 'Search' },
-  { path: '/compare', label: '条目对比', icon: 'Files' }
+  { path: '/compare', label: '条目对比', icon: 'Files' },
+  { path: '/adjudicate', label: '结论裁定', icon: 'Scale' }
 ]
 
 const activeMenu = computed(() => menus.find((item) => route.path.startsWith(item.path))?.path ?? '/atlas')
@@ -28,6 +30,18 @@ const stats = computed(() => [
   { label: '采集点', value: pointState.points.length },
   { label: '鉴定留痕', value: identifyState.logs.length }
 ])
+
+/** 两侧对不上、待重新确认的结论数（按依据认范围） */
+const staleCount = computed(() => {
+  let count = 0
+  for (const record of recordState.records) {
+    const log = identifyState.logs.find((item) => item.recordId === record.id)
+    if (!log) continue
+    const spore = sporeState.spores.find((item) => item.recordId === record.id) ?? null
+    if (evaluateReview(record, spore, log).stale) count += 1
+  }
+  return count
+})
 
 onMounted(async () => {
   await recordStore.getState().hydrate()
@@ -51,6 +65,16 @@ onMounted(async () => {
         <el-menu-item v-for="item in menus" :key="item.path" :index="item.path">
           <el-icon><component :is="item.icon" /></el-icon>
           <span>{{ item.label }}</span>
+          <el-tag
+            v-if="item.path === '/adjudicate' && staleCount > 0"
+            size="small"
+            type="danger"
+            effect="dark"
+            round
+            class="menu-badge"
+          >
+            {{ staleCount }}
+          </el-tag>
         </el-menu-item>
       </el-menu>
       <div class="stat-box">
@@ -128,6 +152,9 @@ onMounted(async () => {
 }
 :deep(.menu .el-menu-item:hover) {
   background: #4d3826;
+}
+.menu-badge {
+  margin-left: auto;
 }
 .stat-box {
   margin-top: auto;

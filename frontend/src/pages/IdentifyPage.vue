@@ -86,7 +86,7 @@ async function saveLog(): Promise<void> {
     ElMessage.warning('请填写结论学名')
     return
   }
-  const log: IdentifyLog = {
+  const log: Omit<IdentifyLog, 'reviewStatus' | 'basisSnapshot'> = {
     id: uid('idf'),
     recordId: active.value.id,
     conclusion: logForm.conclusion.trim(),
@@ -98,7 +98,7 @@ async function saveLog(): Promise<void> {
     reviewer: logForm.reviewer.trim(),
     date: new Date().toISOString().slice(0, 10)
   }
-  await identifyStore.getState().save(log)
+  await identifyStore.getState().saveConclusion(log)
   ElMessage.success(`${active.value.code} 已记录结论：${log.conclusion}（${log.confidence}）`)
   logForm.conclusion = ''
 }
@@ -221,6 +221,13 @@ const latestOf = (recordId: string): IdentifyLog | undefined =>
             记录鉴定结论
             <span v-if="active" class="muted"> · 目标条目 {{ active.code }}（{{ pointName(active.pointId) }}）</span>
           </template>
+          <el-alert
+            type="info"
+            show-icon
+            class="basis-hint"
+            title="结论按依据认范围"
+            description="形态特征→形态改动后需重新确认；孢子印→只看孢子印有没有变；显微观察→两边不动，结论锁定。保存时会按当前采集侧数据锚定快照。"
+          />
           <el-form label-width="92px">
             <el-form-item label="结论学名" required>
               <el-input v-model="logForm.conclusion" placeholder="如 Lepista sordida" />
@@ -368,6 +375,9 @@ const latestOf = (recordId: string): IdentifyLog | undefined =>
   font-size: 11px;
   color: #6f7d72;
   line-height: 1.7;
+}
+.basis-hint {
+  margin-bottom: 12px;
 }
 .rule p {
   margin: 0;

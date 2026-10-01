@@ -66,4 +66,26 @@ export interface FungusRecord {
   collector: string
   /** 备注（不可作为食用依据） */
   note: string
+  /** 归属侧：采集侧（形态特征与采集信息）；复核侧结论与状态另见 identifies 表 */
+  side?: 'collector'
 }
+
+/** 形态特征草稿（采集侧可编辑的形态字段） */
+export type TraitsDraft = Pick<
+  FungusRecord,
+  | 'capDiameter'
+  | 'capShape'
+  | 'capMargin'
+  | 'capTexture'
+  | 'fleshThickness'
+  | 'fleshReaction'
+  | 'attachment'
+  | 'gillDensity'
+  | 'stipeLength'
+  | 'stipeDiameter'
+  | 'ring'
+  | 'volva'
+  | 'odor'
+  | 'hostTree'
+  | 'fruitBodyCount'
+>

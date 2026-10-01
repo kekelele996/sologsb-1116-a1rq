@@ -5,7 +5,7 @@ import 'element-plus/dist/index.css'
 import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 import App from '@/App.vue'
 import router from '@/router'
-import { seedDemoData, stampDbVersion } from '@/hooks/usePersistentStore'
+import { seedDemoData, stampDbVersion, backfillSides } from '@/hooks/usePersistentStore'
 import { recordStore } from '@/stores/recordStore'
 import { sporeStore } from '@/stores/sporeStore'
 import { pointStore } from '@/stores/pointStore'
@@ -14,6 +14,8 @@ import '@/styles/main.css'
 
 async function bootstrap(): Promise<void> {
   await seedDemoData()
+  // 第一次打开先回填两侧归属（老数据补 side / 复核状态 / 依据快照），再启用分边
+  await backfillSides()
   await stampDbVersion()
   await pointStore.getState().hydrate()
   await recordStore.getState().hydrate()
