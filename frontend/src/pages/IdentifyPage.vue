@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import type { IdentifyLog } from '@/types'
 import {
   CAP_MARGINS,
@@ -21,6 +21,7 @@ import { recordStore } from '@/stores/recordStore'
 import { sporeStore } from '@/stores/sporeStore'
 import { identifyStore } from '@/stores/identifyStore'
 import { pointStore } from '@/stores/pointStore'
+import { reviewStatusOf } from '@/utils/side'
 import { uid } from '@/utils/id'
 
 const recordState = useStore(recordStore)
@@ -86,7 +87,8 @@ async function saveLog(): Promise<void> {
     ElMessage.warning('请填写结论学名')
     return
   }
-  const log: IdentifyLog = {
+  // 复核侧保存：只写鉴定表，依据快照由 store 按当前形态 / 孢子印留底
+  const saved = await identifyStore.getState().save({
     id: uid('idf'),
     recordId: active.value.id,
     conclusion: logForm.conclusion.trim(),
@@ -97,14 +99,59 @@ async function saveLog(): Promise<void> {
     needReview: logForm.needReview,
     reviewer: logForm.reviewer.trim(),
     date: new Date().toISOString().slice(0, 10)
-  }
-  await identifyStore.getState().save(log)
-  ElMessage.success(`${active.value.code} 已记录结论：${log.conclusion}（${log.confidence}）`)
+  })
+  ElMessage.success(`${active.value.code} 已记录结论：${saved.conclusion}（${saved.confidence}）`)
   logForm.conclusion = ''
 }
 
 const latestOf = (recordId: string): IdentifyLog | undefined =>
   identifyState.logs.find((item) => item.recordId === recordId)
+
+function latestStateOf(recordId: string): string | null {
+  const log = latestOf(recordId)
+  return log ? statusOf(log).state : null
+}
+
+function sporeOf(recordId: string) {
+  return sporeState.spores.find((item) => item.recordId === recordId) ?? null
+}
+
+function statusOf(log: IdentifyLog) {
+  return reviewStatusOf(log, recordState.records.find((item) => item.id === log.recordId), sporeOf(log.recordId) ?? undefined)
+}
+
+/**
+ * 两边对不上：待复核 / 需重新确认的留痕按采集编号摆出来等人裁定。
+ * 显微观察永不进队列；形态依据只看形态签名，孢子印依据只看孢子印签名。
+ */
+const pendingQueue = computed(() => {
+  const queue = identifyState.logs
+    .map((log) => ({ log, status: statusOf(log) }))
+    .filter((item) => item.status.state === 'pending' || item.status.state === 'reconfirm')
+    .map((item) => ({
+      ...item,
+      record: recordState.records.find((record) => record.id === item.log.recordId) ?? null
+    }))
+    .filter((item) => item.record)
+  return queue.sort((a, b) => a.record!.code.localeCompare(b.record!.code, 'zh-Hans-CN'))
+})
+
+function focusRecord(recordId: string): void {
+  activeRecordId.value = recordId
+  ElMessage.info('已定位到该条目，可在下方更新结论')
+}
+
+/** 重新确认：结论不变，复核侧追加一条带新快照的留痕后自动出队 */
+async function reconfirm(log: IdentifyLog): Promise<void> {
+  const { value: reviewer } = await ElMessageBox.prompt('沿用原结论重新确认，请填写复核人', '重新确认结论', {
+    confirmButtonText: '确认并留痕',
+    cancelButtonText: '取消',
+    inputValue: log.reviewer,
+    inputPlaceholder: '如 祁野'
+  })
+  await identifyStore.getState().reconfirm(log, reviewer)
+  ElMessage.success('已重新确认并刷新依据快照，原结论保持不变')
+}
 </script>
 
 <template>
@@ -208,12 +255,62 @@ const latestOf = (recordId: string): IdentifyLog | undefined =>
                 >
                   以该条为结论草稿
                 </el-button>
-                <span v-if="latestOf(item.record.id)" class="muted">已有结论：{{ latestOf(item.record.id)?.conclusion }}</span>
+                <template v-if="latestOf(item.record.id)">
+                  <span class="muted">已有结论：{{ latestOf(item.record.id)?.conclusion }}</span>
+                  <el-tag
+                    v-if="latestStateOf(item.record.id) === 'reconfirm'"
+                    size="small"
+                    type="danger"
+                    effect="dark"
+                  >
+                    需重认
+                  </el-tag>
+                </template>
                 <span v-else class="muted">尚无结论</span>
               </div>
             </button>
             <el-empty v-if="candidates.length === 0" description="暂无条目，先去图谱总览新建" />
           </div>
+        </el-card>
+
+        <el-card shadow="never" class="queue-card">
+          <template #header>
+            <div class="card-head">
+              <span>待裁定队列（{{ pendingQueue.length }}）· 按采集编号排列</span>
+              <el-tooltip content="形态依据只盯形态改动，孢子印依据只盯孢子印改动，显微观察不入队">
+                <el-tag size="small" type="info" effect="plain">认范围规则</el-tag>
+              </el-tooltip>
+            </div>
+          </template>
+          <el-table :data="pendingQueue" border size="small">
+            <el-table-column label="采集编号" width="150">
+              <template #default="{ row }">{{ row.record?.code }}</template>
+            </el-table-column>
+            <el-table-column prop="log.conclusion" label="结论" min-width="150" />
+            <el-table-column prop="log.basis" label="依据" width="90" />
+            <el-table-column label="状态 / 原因" min-width="200">
+              <template #default="{ row }">
+                <el-tag v-if="row.status.state === 'pending'" type="warning" size="small" effect="dark">待复核</el-tag>
+                <el-tag v-else type="danger" size="small" effect="dark">需重新确认</el-tag>
+                <span v-if="row.status.reason" class="queue-reason">{{ row.status.reason }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="170">
+              <template #default="{ row }">
+                <el-button size="small" @click="focusRecord(row.log.recordId)">定位条目</el-button>
+                <el-button
+                  v-if="row.status.state === 'reconfirm'"
+                  size="small"
+                  type="danger"
+                  plain
+                  @click="reconfirm(row.log)"
+                >
+                  重新确认
+                </el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-if="pendingQueue.length === 0" description="两侧一致，暂无待裁定条目" :image-size="70" />
         </el-card>
 
         <el-card shadow="never" class="log-card">
@@ -232,8 +329,7 @@ const latestOf = (recordId: string): IdentifyLog | undefined =>
                     <el-option v-for="item in ID_BASES" :key="item" :label="item" :value="item" />
                   </el-select>
                 </el-form-item>
-              </el-col>
-              <el-col :span="12">
+              </el-col>              <el-col :span="12">
                 <el-form-item label="置信度">
                   <el-select v-model="logForm.confidence" style="width: 100%">
                     <el-option v-for="item in ID_CONFIDENCES" :key="item" :label="item" :value="item" />
@@ -265,8 +361,11 @@ const latestOf = (recordId: string): IdentifyLog | undefined =>
                 </el-form-item>
               </el-col>
             </el-row>
+            <p class="basis-hint">
+              结论按依据认范围：形态特征 → 形态改动需重认；孢子印 → 只看孢子印变没变；显微观察 → 两边都不动。
+            </p>
             <div class="form-actions">
-              <el-button type="primary" @click="saveLog">保存鉴定结论</el-button>
+              <el-button type="primary" @click="saveLog">保存鉴定结论（仅复核侧）</el-button>
             </div>
           </el-form>
         </el-card>
@@ -298,8 +397,23 @@ const latestOf = (recordId: string): IdentifyLog | undefined =>
   justify-content: space-between;
 }
 .candidate-card,
+.queue-card,
 .log-card {
   border-radius: 12px;
+}
+.queue-card {
+  margin-top: 16px;
+}
+.queue-reason {
+  margin-left: 8px;
+  font-size: 11px;
+  color: #a45b1f;
+}
+.basis-hint {
+  margin: -4px 0 12px 92px;
+  font-size: 11px;
+  color: #7f8d82;
+  line-height: 1.6;
 }
 .candidate-list {
   display: flex;

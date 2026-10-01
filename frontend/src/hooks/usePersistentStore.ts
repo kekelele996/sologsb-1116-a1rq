@@ -2,9 +2,11 @@ import { onUnmounted, reactive } from 'vue'
 import type { StoreApi } from 'zustand/vanilla'
 import Dexie, { type Table } from 'dexie'
 import type { CollectPoint, FungusRecord, IdentifyLog, SporePrint } from '@/types'
+import { SIDE_COLLECT, SIDE_REVIEW } from '@/types'
+import { morphSignature, sporeSignature } from '@/utils/side'
 
 /** IndexedDB 数据结构版本号 */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
@@ -29,7 +31,7 @@ class FungiGuideDb extends Dexie {
       meta: 'key'
     })
     // v2：新增「菌肉变色反应」字段，迁移时为历史条目补齐默认值（不变色）
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         records: 'id, code, pointId, attachment, capShape',
         spores: 'id, recordId, color, observeDate',
@@ -47,6 +49,45 @@ class FungiGuideDb extends Dexie {
             }
           })
       })
+    // v3：采集 / 复核分边。回填归属，历史结论按当时数据补依据快照（基线即当前，不产生失效）
+    this.version(SCHEMA_VERSION)
+      .stores({
+        records: 'id, code, pointId, attachment, capShape, ownerSide',
+        spores: 'id, recordId, color, observeDate, ownerSide',
+        points: 'id, name, substrate, vegetation',
+        identifies: 'id, recordId, conclusion, date, ownerSide',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        const records = await tx.table<FungusRecord, string>('records').toArray()
+        const spores = await tx.table<SporePrint, string>('spores').toArray()
+        const recordMap = new Map(records.map((record) => [record.id, record]))
+        const sporeMap = new Map(spores.map((spore) => [spore.recordId, spore]))
+
+        await tx
+          .table<FungusRecord, string>('records')
+          .toCollection()
+          .modify((record) => {
+            record.ownerSide = SIDE_COLLECT
+          })
+        await tx
+          .table<SporePrint, string>('spores')
+          .toCollection()
+          .modify((spore) => {
+            spore.ownerSide = SIDE_COLLECT
+          })
+        await tx
+          .table<IdentifyLog, string>('identifies')
+          .toCollection()
+          .modify((log) => {
+            log.ownerSide = SIDE_REVIEW
+            // 历史留痕：以当前形态 / 孢子印为基线补快照，老结论不会被回填动作打成失效
+            const record = recordMap.get(log.recordId)
+            const spore = sporeMap.get(log.recordId)
+            if (!log.morphSnapshot && record) log.morphSnapshot = morphSignature(record)
+            if (!log.sporeSnapshot && spore) log.sporeSnapshot = sporeSignature(spore)
+          })
+      })
   }
 }
 
@@ -55,6 +96,51 @@ export const db = new FungiGuideDb()
 /** 写入当前数据结构版本号 */
 export async function stampDbVersion(): Promise<void> {
   await db.meta.put({ key: 'schemaVersion', value: SCHEMA_VERSION })
+}
+
+/**
+ * 第一次打开先回填归属再启用：没分过边的老数据（如手工导入 / 升级未覆盖）
+ * 在这里幂等补齐 ownerSide 与依据快照，全部完成后界面才启用。
+ */
+export async function backfillOwnership(): Promise<void> {
+  await db.transaction('rw', db.records, db.spores, db.identifies, async () => {
+    const records = await db.records.toArray()
+    const spores = await db.spores.toArray()
+    const recordMap = new Map(records.map((record) => [record.id, record]))
+    const sporeMap = new Map(spores.map((spore) => [spore.recordId, spore]))
+
+    const dirtyRecords = records.filter((record) => record.ownerSide !== SIDE_COLLECT)
+    if (dirtyRecords.length > 0) {
+      await db.records.bulkPut(dirtyRecords.map((record) => ({ ...record, ownerSide: SIDE_COLLECT })))
+    }
+
+    const dirtySpores = spores.filter((spore) => spore.ownerSide !== SIDE_COLLECT)
+    if (dirtySpores.length > 0) {
+      await db.spores.bulkPut(dirtySpores.map((spore) => ({ ...spore, ownerSide: SIDE_COLLECT })))
+    }
+
+    const logs = await db.identifies.toArray()
+    const dirtyLogs = logs
+      .map((log) => {
+        const next: IdentifyLog = { ...log, ownerSide: SIDE_REVIEW }
+        const record = recordMap.get(log.recordId)
+        const spore = sporeMap.get(log.recordId)
+        if (!next.morphSnapshot && record) next.morphSnapshot = morphSignature(record)
+        if (!next.sporeSnapshot && spore) next.sporeSnapshot = sporeSignature(spore)
+        return next
+      })
+      .filter((log, index) => {
+        const original = logs[index]
+        return (
+          original.ownerSide !== SIDE_REVIEW ||
+          original.morphSnapshot !== log.morphSnapshot ||
+          original.sporeSnapshot !== log.sporeSnapshot
+        )
+      })
+    if (dirtyLogs.length > 0) {
+      await db.identifies.bulkPut(dirtyLogs)
+    }
+  })
 }
 
 /** 读取整表 */
@@ -139,7 +225,8 @@ export async function seedDemoData(): Promise<void> {
       hostTree: '辽东栎',
       collectDate: today,
       collector: '沈禾',
-      note: '菌管层易剥离，仅作形态记录'
+      note: '菌管层易剥离，仅作形态记录',
+      ownerSide: SIDE_COLLECT
     },
     {
       id: 'rec_002',
@@ -163,7 +250,8 @@ export async function seedDemoData(): Promise<void> {
       hostTree: '油松',
       collectDate: today,
       collector: '沈禾',
-      note: '菌褶边缘略带紫晕'
+      note: '菌褶边缘略带紫晕',
+      ownerSide: SIDE_COLLECT
     },
     {
       id: 'rec_003',
@@ -187,7 +275,8 @@ export async function seedDemoData(): Promise<void> {
       hostTree: '麻栎',
       collectDate: today,
       collector: '祁野',
-      note: '生于倒木侧面，质地木栓化'
+      note: '生于倒木侧面，质地木栓化',
+      ownerSide: SIDE_COLLECT
     }
   ])
 
@@ -199,7 +288,8 @@ export async function seedDemoData(): Promise<void> {
       shape: '圆形印痕，边缘略散',
       hours: 12,
       observeDate: today,
-      moisture: '子实体偏干，印痕较薄'
+      moisture: '子实体偏干，印痕较薄',
+      ownerSide: SIDE_COLLECT
     },
     {
       id: 'spo_002',
@@ -208,7 +298,8 @@ export async function seedDemoData(): Promise<void> {
       shape: '圆形印痕，中心致密',
       hours: 8,
       observeDate: today,
-      moisture: '新鲜子实体，印痕厚实'
+      moisture: '新鲜子实体，印痕厚实',
+      ownerSide: SIDE_COLLECT
     },
     {
       id: 'spo_003',
@@ -217,7 +308,8 @@ export async function seedDemoData(): Promise<void> {
       shape: '不规则印痕',
       hours: 24,
       observeDate: today,
-      moisture: '木质化样本，印痕浅'
+      moisture: '木质化样本，印痕浅',
+      ownerSide: SIDE_COLLECT
     }
   ])
 
@@ -232,7 +324,11 @@ export async function seedDemoData(): Promise<void> {
       confidence: '低',
       needReview: true,
       reviewer: '祁野',
-      date: today
+      date: today,
+      ownerSide: SIDE_REVIEW,
+      // 快照由首次启动的归属回填按当前数据补齐
+      morphSnapshot: '',
+      sporeSnapshot: ''
     },
     {
       id: 'idf_002',
@@ -244,7 +340,10 @@ export async function seedDemoData(): Promise<void> {
       confidence: '中',
       needReview: false,
       reviewer: '祁野',
-      date: today
+      date: today,
+      ownerSide: SIDE_REVIEW,
+      morphSnapshot: '',
+      sporeSnapshot: ''
     }
   ])
 }

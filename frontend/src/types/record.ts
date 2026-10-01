@@ -1,4 +1,6 @@
 /** 菌褶/菌管着生方式 */
+import type { DataSide } from './side'
+
 export const GILL_ATTACHMENTS = ['离生', '弯生', '直生', '延生'] as const
 export type GillAttachment = (typeof GILL_ATTACHMENTS)[number]
 
@@ -66,4 +68,9 @@ export interface FungusRecord {
   collector: string
   /** 备注（不可作为食用依据） */
   note: string
+  /**
+   * 归属侧：形态特征由采集人维护，恒为 collect。
+   * 复核侧写入若碰到该归属会被拒绝，改动只落本侧。
+   */
+  ownerSide: DataSide
 }

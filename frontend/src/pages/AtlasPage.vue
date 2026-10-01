@@ -11,6 +11,7 @@ import {
   GILL_ATTACHMENTS,
   GILL_DENSITIES,
   RING_TYPES,
+  SIDE_COLLECT,
   SPORE_COLORS,
   VOLVA_TYPES
 } from '@/types'
@@ -23,6 +24,7 @@ import { recordStore } from '@/stores/recordStore'
 import { sporeStore } from '@/stores/sporeStore'
 import { pointStore } from '@/stores/pointStore'
 import { identifyStore } from '@/stores/identifyStore'
+import { reviewStatusOf } from '@/utils/side'
 import { uid } from '@/utils/id'
 
 const router = useRouter()
@@ -77,9 +79,23 @@ function pointName(pointId: string): string {
   return pointState.points.find((point) => point.id === pointId)?.name ?? '未关联采集点'
 }
 
-function identifyOf(recordId: string): { conclusion: string; confidence: string; needReview: boolean } | null {
+function identifyOf(recordId: string): {
+  conclusion: string
+  confidence: string
+  needReview: boolean
+  reconfirm: boolean
+} | null {
   const log = identifyState.logs.find((item) => item.recordId === recordId)
-  return log ? { conclusion: log.conclusion, confidence: log.confidence, needReview: log.needReview } : null
+  if (!log) return null
+  const record = recordState.records.find((item) => item.id === recordId)
+  const spore = sporeState.spores.find((item) => item.recordId === recordId)
+  const status = reviewStatusOf(log, record, spore)
+  return {
+    conclusion: log.conclusion,
+    confidence: log.confidence,
+    needReview: status.state === 'pending',
+    reconfirm: status.state === 'reconfirm'
+  }
 }
 
 function toggleCompare(id: string): void {
@@ -175,7 +191,8 @@ async function submit(): Promise<void> {
     hostTree: form.hostTree.trim(),
     collectDate: form.collectDate,
     collector: form.collector.trim(),
-    note: form.note.trim()
+    note: form.note.trim(),
+    ownerSide: SIDE_COLLECT
   }
   await recordStore.getState().save(record)
   dialogVisible.value = false
@@ -259,6 +276,9 @@ async function removeRecord(record: FungusRecord): Promise<void> {
               置信度 {{ identifyOf(item.record.id)?.confidence }}
               <template v-if="identifyOf(item.record.id)?.needReview"> · 待复核</template>
             </span>
+            <el-tag v-if="identifyOf(item.record.id)?.reconfirm" type="danger" size="small" effect="dark">
+              需重新确认
+            </el-tag>
           </template>
           <el-tag v-else type="warning" size="small" effect="plain">尚无鉴定结论</el-tag>
           <el-tag v-if="item.percent > 0" size="small" effect="plain">匹配度 {{ item.percent }}%</el-tag>

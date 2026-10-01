@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, reactive, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import type { CollectPoint, SporeColor, SporePrint } from '@/types'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import type { CollectPoint, IdentifyLog, SporeColor, SporePrint } from '@/types'
+import { SIDE_COLLECT } from '@/types'
 import { SPORE_COLORS } from '@/types'
 import GeoPointForm from '@/components/common/GeoPointForm.vue'
 import GillAttachmentTag from '@/components/common/GillAttachmentTag.vue'
+import MorphologyDialog from '@/components/common/MorphologyDialog.vue'
 import SporePrintSwatch from '@/components/common/SporePrintSwatch.vue'
 import TraitsSummary from '@/components/common/TraitsSummary.vue'
 import { useStore } from '@/hooks/usePersistentStore'
@@ -13,11 +15,13 @@ import { recordStore } from '@/stores/recordStore'
 import { sporeStore } from '@/stores/sporeStore'
 import { pointStore } from '@/stores/pointStore'
 import { identifyStore } from '@/stores/identifyStore'
+import { reviewStatusOf } from '@/utils/side'
 import { sporeColorHex } from '@/utils/spore'
 import { uid } from '@/utils/id'
 
 const route = useRoute()
 const router = useRouter()
+type IdentifyLogRow = IdentifyLog
 const recordState = useStore(recordStore)
 const sporeState = useStore(sporeStore)
 const pointState = useStore(pointStore)
@@ -26,6 +30,15 @@ const identifyState = useStore(identifyStore)
 const record = computed(() => recordState.records.find((item) => item.id === route.params.id) ?? null)
 const spore = computed(() => sporeState.spores.find((item) => item.recordId === record.value?.id) ?? null)
 const logs = computed(() => identifyState.logs.filter((item) => item.recordId === record.value?.id))
+/** 最新一条复核留痕的读时状态（按依据认范围派生） */
+const latestLog = computed(() => logs.value[0] ?? null)
+const latestStatus = computed(() =>
+  latestLog.value ? reviewStatusOf(latestLog.value, record.value ?? undefined, spore.value ?? undefined) : null
+)
+
+const morphDialogVisible = ref(false)
+/** 采集侧孢子印保存失败后保留草稿，按本侧重试 */
+const sporeSaveFailed = ref(false)
 /** 当前条目所属采集点名称（在脚本内取，避免模板内箭头函数丢失空值收窄） */
 const recordPointName = computed(() => {
   const current = record.value
@@ -74,8 +87,8 @@ watch(
   { immediate: true }
 )
 
-async function saveSpore(): Promise<void> {
-  if (!record.value) return
+async function saveSpore(): Promise<boolean> {
+  if (!record.value) return false
   const row: SporePrint = {
     id: sporeForm.id || uid('spo'),
     recordId: record.value.id,
@@ -83,11 +96,25 @@ async function saveSpore(): Promise<void> {
     shape: sporeForm.shape.trim(),
     hours: Number(sporeForm.hours) || 0,
     observeDate: sporeForm.observeDate,
-    moisture: sporeForm.moisture.trim()
+    moisture: sporeForm.moisture.trim(),
+    ownerSide: SIDE_COLLECT
   }
-  await sporeStore.getState().save(row)
-  sporeForm.id = row.id
-  ElMessage.success(`孢子印观察已记录：${row.color}`)
+  try {
+    // 采集侧保存：失败按本侧自动重试，复核侧数据原样保留
+    await sporeStore.getState().save(row)
+    sporeForm.id = row.id
+    sporeSaveFailed.value = false
+    ElMessage.success(`孢子印观察已记录：${row.color}`)
+    return true
+  } catch {
+    sporeSaveFailed.value = true
+    ElMessage.error('孢子印保存失败，草稿已保留，请点「重试保存」（复核侧不受影响）')
+    return false
+  }
+}
+
+async function retrySaveSpore(): Promise<void> {
+  await saveSpore()
 }
 
 async function savePoint(): Promise<void> {
@@ -103,9 +130,22 @@ async function removeSpore(): Promise<void> {
   if (!sporeForm.id) return
   await sporeStore.getState().remove(sporeForm.id)
   sporeForm.id = ''
+  sporeSaveFailed.value = false
   ElMessage.success('孢子印记录已删除')
 }
-</script>
+
+/** 复核人重新确认：结论本体不改，复核侧追加留痕并刷新依据快照 */
+async function reconfirm(): Promise<void> {
+  if (!latestLog.value) return
+  const { value: reviewer } = await ElMessageBox.prompt('请填写复核人姓名（沿用结论，仅刷新复核状态）', '重新确认', {
+    confirmButtonText: '确认并留痕',
+    cancelButtonText: '取消',
+    inputValue: latestLog.value.reviewer,
+    inputPlaceholder: '如 祁野'
+  })
+  await identifyStore.getState().reconfirm(latestLog.value, reviewer)
+  ElMessage.success('已重新确认，结论保持不变并刷新依据快照')
+}</script>
 
 <template>
   <div class="page">
@@ -129,11 +169,21 @@ async function removeSpore(): Promise<void> {
     </div>
 
     <template v-if="record">
+      <div class="side-banner collect-banner">
+        <span class="side-tag">采集侧</span>
+        <span>形态特征、孢子印观察由采集人维护，改动只落本侧；保存失败按本侧重试。</span>
+      </div>
+
       <el-card shadow="never" class="block">
         <template #header>
           <div class="block-head">
             <span>形态描述</span>
-            <GillAttachmentTag :attachment="record.attachment" with-hint />
+            <div class="head-right">
+              <GillAttachmentTag :attachment="record.attachment" with-hint />
+              <el-button size="small" type="primary" plain @click="morphDialogVisible = true">
+                补录 / 修订形态
+              </el-button>
+            </div>
           </div>
         </template>
         <TraitsSummary :record="record" :spore="spore" :default-open="['cap', 'flesh', 'gill', 'stipe', 'eco']" />
@@ -147,6 +197,16 @@ async function removeSpore(): Promise<void> {
             <SporePrintSwatch :color="spore?.color ?? null" size="large" :caption="spore ? `获取 ${spore.hours} h` : '尚未记录'" />
           </div>
         </template>
+        <el-alert
+          v-if="sporeSaveFailed"
+          class="retry-bar"
+          type="error"
+          show-icon
+          :closable="false"
+          title="采集侧保存失败，草稿已保留；复核侧数据未受影响。"
+        >
+          <el-button size="small" type="danger" plain @click="retrySaveSpore">按本侧重试保存</el-button>
+        </el-alert>
         <div class="spore-body">
           <div class="spore-current" :style="{ background: spore ? sporeColorHex(spore.color) : '#f2f4f6' }">
             <div v-if="spore" class="spore-info">
@@ -177,6 +237,7 @@ async function removeSpore(): Promise<void> {
             </el-form-item>
             <div class="form-actions">
               <el-button type="primary" @click="saveSpore">{{ sporeForm.id ? '更新孢子印' : '登记孢子印' }}</el-button>
+              <el-button v-if="sporeSaveFailed" type="warning" plain @click="retrySaveSpore">重试保存</el-button>
               <el-button v-if="sporeForm.id" type="danger" plain @click="removeSpore">删除记录</el-button>
             </div>
           </el-form>
@@ -191,8 +252,48 @@ async function removeSpore(): Promise<void> {
         </div>
       </el-card>
 
+      <div class="side-banner review-banner">
+        <span class="side-tag">复核侧</span>
+        <span>结论与复核状态由复核人维护；采集人补形态不会盖掉结论，形态 / 孢子印变动只挂「需重新确认」。</span>
+      </div>
+
       <el-card shadow="never" class="block">
-        <template #header>鉴定留痕（{{ logs.length }} 条）</template>
+        <template #header>
+          <div class="block-head">
+            <span>当前复核结论</span>
+            <el-tag v-if="!latestLog" type="info" effect="plain" size="small">尚无结论</el-tag>
+            <el-tag v-else-if="latestStatus?.state === 'pending'" type="warning" effect="dark" size="small">待复核</el-tag>
+            <el-tag v-else-if="latestStatus?.state === 'reconfirm'" type="danger" effect="dark" size="small">需重新确认</el-tag>
+            <el-tag v-else type="success" effect="dark" size="small">已确认</el-tag>
+          </div>
+        </template>
+        <template v-if="latestLog">
+          <div class="conclusion-line">
+            <b>{{ latestLog.conclusion }}</b>
+            <el-tag size="small" effect="plain">依据：{{ latestLog.basis }}</el-tag>
+            <el-tag size="small" effect="plain">置信度：{{ latestLog.confidence }}</el-tag>
+            <span class="muted">复核人：{{ latestLog.reviewer || '—' }} · {{ latestLog.date }}</span>
+          </div>
+          <el-alert
+            v-if="latestStatus?.state === 'reconfirm'"
+            class="reconfirm-bar"
+            type="error"
+            show-icon
+            :title="latestStatus.reason"
+            :description="`依据范围按「${latestLog.basis}」认；显微观察不挂此提示。`"
+          >
+            <el-button size="small" type="danger" plain @click="reconfirm">复核人重新确认</el-button>
+          </el-alert>
+          <p v-else-if="latestStatus?.state === 'pending'" class="muted tip-line">
+            该结论待复核；采集侧继续补录形态不会改动结论本体。
+          </p>
+          <p v-else class="muted tip-line">结论在依据范围内仍有效；形态 / 孢子印改动只作用于采集侧。</p>
+        </template>
+        <el-empty v-else description="尚无鉴定结论，去「鉴定工作页」由复核人落结论" />
+      </el-card>
+
+      <el-card shadow="never" class="block">
+        <template #header>鉴定留痕（{{ logs.length }} 条，仅复核侧可追加）</template>
         <el-table :data="logs" border stripe>
           <el-table-column prop="date" label="日期" width="120" />
           <el-table-column prop="conclusion" label="结论学名" min-width="160" />
@@ -204,7 +305,7 @@ async function removeSpore(): Promise<void> {
           </el-table-column>
           <el-table-column prop="confidence" label="置信度" width="90" />
           <el-table-column label="复核" width="110">
-            <template #default="{ row }: { row: { needReview: boolean; reviewer: string } }">
+            <template #default="{ row }: { row: IdentifyLogRow }">
               <el-tag v-if="row.needReview" type="warning" size="small" effect="dark">待复核</el-tag>
               <span v-else class="muted">{{ row.reviewer || '已复核' }}</span>
             </template>
@@ -212,14 +313,55 @@ async function removeSpore(): Promise<void> {
         </el-table>
         <el-empty v-if="logs.length === 0" description="尚无鉴定结论，去「鉴定工作页」生成" />
       </el-card>
+
+      <MorphologyDialog v-model="morphDialogVisible" :record="record" />
     </template>
   </div>
 </template>
 
 <style scoped>
+.side-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.collect-banner {
+  background: #eef4ec;
+  color: #2f5d3f;
+  border: 1px solid #cfe2d2;
+}
+.review-banner {
+  margin-top: 24px;
+  background: #f3eef7;
+  color: #5a3d72;
+  border: 1px solid #e0d3ec;
+}
+.side-tag {
+  flex: none;
+  font-weight: 700;
+  padding: 2px 10px;
+  border-radius: 999px;
+  color: #fff;
+}
+.collect-banner .side-tag {
+  background: #4a8a5e;
+}
+.review-banner .side-tag {
+  background: #7d56a0;
+}
 .head-actions {
   display: flex;
   gap: 8px;
+}
+.head-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 .block {
   border-radius: 12px;
@@ -230,6 +372,22 @@ async function removeSpore(): Promise<void> {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+.conclusion-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 15px;
+  color: #2b3a2f;
+}
+.tip-line {
+  margin: 10px 0 0;
+}
+.retry-bar,
+.reconfirm-bar {
+  margin-top: 12px;
+  align-items: center;
 }
 .note {
   margin: 10px 0 0;

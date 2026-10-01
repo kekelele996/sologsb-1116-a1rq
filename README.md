@@ -37,6 +37,7 @@ FRONTEND_PORT=21816
 | 路由 | Vue Router 4（History 模式，nginx `try_files` 回落） |
 | 构建 | Vite 6 |
 | 本地存储 | IndexedDB（Dexie 封装，含 `schemaVersion` 与升级迁移） |
+| 并发模型 | 采集侧 / 复核侧分边各管各的（ownerSide 归属 + 本侧写入隔离） |
 | 部署 | 多阶段 Dockerfile：`node:20-alpine` 构建 → `nginx:alpine` 托管 |
 
 ## 三、本地开发
@@ -59,13 +60,13 @@ sologsb-1116/
 │   ├── nginx.conf              # try_files 前端路由回落 + gzip
 │   ├── public/favicon.svg
 │   └── src/
-│       ├── types/              # record.ts / spore.ts / point.ts / identify.ts / index.ts
-│       ├── stores/             # recordStore / sporeStore / pointStore / identifyStore（Zustand）
-│       ├── components/common/  # SporePrintSwatch / TraitsSummary / GillAttachmentTag / GeoPointForm
+│       ├── types/              # record.ts / spore.ts / point.ts / identify.ts / side.ts / index.ts
+│       ├── stores/             # appStore / recordStore / sporeStore / pointStore / identifyStore（Zustand）
+│       ├── components/common/  # SporePrintSwatch / TraitsSummary / GillAttachmentTag / GeoPointForm / MorphologyDialog
 │       ├── hooks/              # usePersistentStore / useCandidateMatch
 │       ├── pages/              # AtlasPage / RecordDetailPage / PointsPage / IdentifyPage / ComparePage
 │       ├── router/index.ts
-│       └── utils/              # spore.ts / export.ts / id.ts
+│       └── utils/              # spore.ts / side.ts（分边/签名/重试） / export.ts / id.ts
 ```
 
 ## 五、数据模型与存储
@@ -75,20 +76,40 @@ sologsb-1116/
 | FungusRecord 菌物条目 | 采集编号、暂定名、菌盖（直径/形状/边缘/质地）、菌肉厚度与变色反应、着生方式、菌褶密度、菌柄、菌环菌托、气味、关联树种 | `records` |
 | SporePrint 孢子印 | 印色、印形、获取时长、观察日期、样本干湿度 | `spores` |
 | CollectPoint 采集点 | 地点名、经纬度、海拔、植被类型、基物、伴生树种、日期、采集人 | `points` |
-| IdentifyLog 鉴定结论 | 结论学名、依据、参考图鉴与页码、置信度、是否待复核、复核人 | `identifies` |
+| IdentifyLog 鉴定结论（复核侧） | 结论学名、依据、参考图鉴与页码、置信度、是否待复核、复核人、形态/孢子印依据快照 | `identifies` |
 
 - 数据库名 `gbfungiguide`，`meta` 表保存 `schemaVersion`；
 - `version(2)` 升级迁移会为历史条目补齐「菌肉变色反应」默认值（不变色）；
+- `version(3)` 采集 / 复核分边：为四类数据回填 `ownerSide`，并为历史鉴定留痕按当时形态 / 孢子印补依据快照（基线即当前，回填不产生失效）；
 - 数据仅存于浏览器本地，容器无状态、不挂载命名卷。
+
+## 五·补、采集 / 复核分边规则
+
+条目不再由采集人与复核人共用一份可互相覆盖的记录，两侧各管各的、改动只落本侧：
+
+| 侧 | 归属（`ownerSide`） | 可写数据 |
+| --- | --- | --- |
+| 采集侧 `collect` | 采集人 | 形态特征（`records` 形态字段）、孢子印观察（`spores`） |
+| 复核侧 `review` | 复核人 | 结论、依据、置信度、复核状态（`identifies`） |
+
+- **互不覆盖**：写入带归属校验（`assertSide`），跨侧改动抛 `SideMismatchError`；采集人补形态不会盖掉结论，复核也不会冲掉形态。
+- **结论按依据认范围**：落结论时留存依据签名（`morphSnapshot` / `sporeSnapshot`）。
+  - 依据「形态特征」：形态签名变了，结论挂「需重新确认」；
+  - 依据「孢子印」：只看孢子印签名变没变，形态改动不影响它；
+  - 依据「显微观察」：两边都不动，永不失效。
+- **重新确认**：复核人重认时结论本体不变，在复核侧**追加**一条带新快照的留痕（原留痕保留）。
+- **待裁定队列**：鉴定工作页把「待复核 / 需重新确认」的条目按采集编号列出，等复核人裁定。
+- **本侧重试**：采集侧保存（`withCollectRetry`）失败自动指数退避重试，耗尽后保留表单草稿供手动重试，全程不触碰复核侧。
+- **首次打开先回填再启用**：启动时先跑归属回填（Dexie v3 升级事务 + 运行时幂等双保险），完成后界面才挂载；回填期间显示启动门，失败可重试。
 
 ## 六、主要页面
 
 | 路由 | 功能 |
 | --- | --- |
 | `/atlas` | 图谱总览：网格卡片展示菌盖形态要点、孢子印色块与鉴定状态，按印色/着生方式筛选并新建条目 |
-| `/atlas/:id` | 条目详情：形态描述分区折叠、孢子印观察登记、采集点编辑（含坐标校验）、鉴定留痕 |
+| `/atlas/:id` | 条目详情：上半页采集侧（形态修订、孢子印登记、采集点），下半页复核侧（当前结论状态、重新确认、留痕） |
 | `/points` | 采集点管理：经纬度格式校验、条目数与主要基物统计、删除前校验下级条目 |
-| `/identify` | 鉴定工作页：左侧勾选形态特征与印色，右侧实时给出候选名录排序，确认后落鉴定结论 |
+| `/identify` | 鉴定工作页：勾选特征给出候选排序、复核侧落结论，顶部「待裁定队列」按采集编号列出待复核/需重认条目 |
 | `/compare` | 条目对比：并排最多 3 条，逐项对照菌盖/菌褶菌管/孢子印差异并高亮 |
 
 ## 七、候选排序规则
